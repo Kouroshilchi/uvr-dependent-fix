@@ -89,7 +89,7 @@ class  _audio_pre_():
             else:
                 wav_instrument = spec_utils.cmb_spectrogram_to_wave(y_spec_m, self.mp)
             print ('%s instruments done'%name)
-            wavfile.write(os.path.join(ins_root, 'instrument_{}.wav'.format(name) ), self.mp.param['sr'], (np.array(wav_instrument)*32768).astype("int16"))  #
+            wavfile.write(os.path.join(ins_root, 'instrument_{}'.format(name) ), self.mp.param['sr'], (np.array(wav_instrument)*32768).astype("int16"))  #
         if (vocal_root is not None):
             if self.data['high_end_process'].startswith('mirroring'):
                 input_high_end_ = spec_utils.mirroring(self.data['high_end_process'],  v_spec_m, input_high_end, self.mp)
@@ -97,7 +97,7 @@ class  _audio_pre_():
             else:
                 wav_vocals = spec_utils.cmb_spectrogram_to_wave(v_spec_m, self.mp)
             print ('%s vocals done'%name)
-            wavfile.write(os.path.join(vocal_root , 'vocal_{}.wav'.format(name) ), self.mp.param['sr'], (np.array(wav_vocals)*32768).astype("int16"))
+            wavfile.write(os.path.join(vocal_root , 'vocal_{}'.format(name) ), self.mp.param['sr'], (np.array(wav_vocals)*32768).astype("int16"))
 
 if __name__ == '__main__':
     device = 'cuda'
