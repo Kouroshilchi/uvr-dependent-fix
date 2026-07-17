@@ -1,5 +1,7 @@
 import os,sys,torch,warnings,pdb
 warnings.filterwarnings("ignore")
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.enabled = True
 import librosa
 import importlib
 import  numpy as np
@@ -22,6 +24,7 @@ class  _audio_pre_():
             'window_size': 512,
             'agg': 10,
             'high_end_process': 'mirroring',
+            'batch_size': 4,   # increase (8/16...) if you have GPU memory to spare
         }
         nn_arch_sizes = [
             31191, # default
@@ -73,7 +76,7 @@ class  _audio_pre_():
         X_spec_m = spec_utils.combine_spectrograms(X_spec_s, self.mp)
         aggresive_set = float(self.data['agg']/100)
         aggressiveness = {'value': aggresive_set, 'split_bin': self.mp.param['band'][1]['crop_stop']}
-        with torch.no_grad():
+        with torch.inference_mode():
             pred, X_mag, X_phase = inference(X_spec_m,self.device,self.model, aggressiveness,self.data)
         # Postprocess
         if self.data['postprocess']:
@@ -82,20 +85,20 @@ class  _audio_pre_():
         y_spec_m = pred * X_phase
         v_spec_m = X_spec_m - y_spec_m
 
-        if (ins_root is not None):
-            if self.data['high_end_process'].startswith('mirroring'):
-                input_high_end_ = spec_utils.mirroring(self.data['high_end_process'], y_spec_m, input_high_end, self.mp)
-                wav_instrument = spec_utils.cmb_spectrogram_to_wave(y_spec_m, self.mp,input_high_end_h, input_high_end_)
-            else:
-                wav_instrument = spec_utils.cmb_spectrogram_to_wave(y_spec_m, self.mp)
-            print ('%s instruments done'%name)
-            wavfile.write(os.path.join(ins_root, 'instrument_{}'.format(name) ), self.mp.param['sr'], (np.array(wav_instrument)*32768).astype("int16"))  #
+        # if (ins_root is not None):
+        #     if self.data['high_end_process'].startswith('mirroring'):
+        #         input_high_end_ = spec_utils.mirroring(self.data['high_end_process'], y_spec_m, input_high_end, self.mp)
+        #         wav_instrument = spec_utils.cmb_spectrogram_to_wave(y_spec_m, self.mp,input_high_end_h, input_high_end_, device=self.device)
+        #     else:
+        #         wav_instrument = spec_utils.cmb_spectrogram_to_wave(y_spec_m, self.mp, device=self.device)
+        #     print ('%s instruments done'%name)
+        #     wavfile.write(os.path.join(ins_root, 'instrument_{}'.format(name) ), self.mp.param['sr'], (np.array(wav_instrument)*32768).astype("int16"))  #
         if (vocal_root is not None):
             if self.data['high_end_process'].startswith('mirroring'):
                 input_high_end_ = spec_utils.mirroring(self.data['high_end_process'],  v_spec_m, input_high_end, self.mp)
-                wav_vocals = spec_utils.cmb_spectrogram_to_wave(v_spec_m, self.mp, input_high_end_h, input_high_end_)
+                wav_vocals = spec_utils.cmb_spectrogram_to_wave(v_spec_m, self.mp, input_high_end_h, input_high_end_, device=self.device)
             else:
-                wav_vocals = spec_utils.cmb_spectrogram_to_wave(v_spec_m, self.mp)
+                wav_vocals = spec_utils.cmb_spectrogram_to_wave(v_spec_m, self.mp, device=self.device)
             print ('%s vocals done'%name)
             wavfile.write(os.path.join(vocal_root , 'vocal_{}'.format(name) ), self.mp.param['sr'], (np.array(wav_vocals)*32768).astype("int16"))
 

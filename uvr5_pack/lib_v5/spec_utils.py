@@ -4,6 +4,22 @@ import soundfile  as  sf
 from tqdm import tqdm
 import json,math ,hashlib
 
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+
+try:
+    import torchaudio
+    _TORCHAUDIO_AVAILABLE = True
+except ImportError:
+    _TORCHAUDIO_AVAILABLE = False
+
+# cache of torchaudio.transforms.Resample instances, keyed by (orig_sr, target_sr, device)
+# so we don't rebuild the resampling filter kernel on every call
+_resampler_cache = {}
+
 def crop_center(h1, h2):
     h1_shape = h1.size()
     h2_shape = h2.size()
@@ -276,17 +292,80 @@ def spectrogram_to_wave_mt(spec, hop_length, mid_side, reverse, mid_side_b2):
         return np.asfortranarray([wave_left, wave_right])
     
     
-def cmb_spectrogram_to_wave(spec_m, mp, extra_bins_h=None, extra_bins=None):
-    wave_band = {}
-    bands_n = len(mp.param['band'])    
+def spectrogram_to_wave_gpu(spec, hop_length, mid_side, reverse, mid_side_b2, device='cuda'):
+    '''
+    Same output as spectrogram_to_wave_mt, but runs the inverse STFT for both
+    channels in a single batched torch.istft call on the GPU instead of two
+    CPU threads calling librosa.istft.
+    '''
+    n_fft = (spec.shape[1] - 1) * 2
+
+    # spec is (2, F, T) complex128 (np.ndarray with dtype=complex) -> complex64 on device
+    spec_t = torch.from_numpy(np.ascontiguousarray(spec)).to(device=device, dtype=torch.complex64)
+    window = torch.hann_window(n_fft, device=device)
+
+    # batched: both channels inverse-STFT'd in one call
+    wave = torch.istft(spec_t, n_fft=n_fft, hop_length=hop_length, window=window, center=True)
+    wave = wave.detach().cpu().numpy()
+    wave_left, wave_right = wave[0], wave[1]
+
+    if reverse:
+        return np.asfortranarray([np.flip(wave_left), np.flip(wave_right)])
+    elif mid_side:
+        return np.asfortranarray([np.add(wave_left, wave_right / 2), np.subtract(wave_left, wave_right / 2)])
+    elif mid_side_b2:
+        return np.asfortranarray([np.add(wave_right / 1.25, .4 * wave_left), np.subtract(wave_left / 1.25, .4 * wave_right)])
+    else:
+        return np.asfortranarray([wave_left, wave_right])
+
+
+def resample_gpu(wave, orig_sr, target_sr, device='cuda'):
+    '''
+    GPU resample via torchaudio.transforms.Resample. Falls back to
+    librosa (CPU) automatically if torchaudio isn't installed.
+    wave: np.ndarray shaped (channels, samples)
+    '''
+    if not _TORCHAUDIO_AVAILABLE:
+        return librosa.resample(wave, orig_sr=orig_sr, target_sr=target_sr, res_type="kaiser_fast")
+
+    key = (orig_sr, target_sr, device)
+    resampler = _resampler_cache.get(key)
+    if resampler is None:
+        resampler = torchaudio.transforms.Resample(orig_freq=orig_sr, new_freq=target_sr).to(device)
+        _resampler_cache[key] = resampler
+
+    wave_t = torch.from_numpy(np.ascontiguousarray(wave)).to(device=device, dtype=torch.float32)
+    with torch.inference_mode():
+        out = resampler(wave_t)
+    return out.detach().cpu().numpy()
+
+
+def cmb_spectrogram_to_wave(spec_m, mp, extra_bins_h=None, extra_bins=None, device=None):
+    '''
+    device=None (default): identical CPU behaviour to before (librosa istft/resample).
+    device='cuda' (or any torch device string): ISTFT and resample run on GPU via
+    torch/torchaudio, with automatic fallback to CPU if torch/torchaudio aren't available.
+    '''
+    bands_n = len(mp.param['band'])
     offset = 0
+    use_gpu = device is not None and _TORCH_AVAILABLE and 'cuda' in str(device)
+
+    def _istft(spec_s, hl):
+        if use_gpu:
+            return spectrogram_to_wave_gpu(spec_s, hl, mp.param['mid_side'], mp.param['reverse'], mp.param['mid_side_b2'], device)
+        return spectrogram_to_wave_mt(spec_s, hl, mp.param['mid_side'], mp.param['reverse'], mp.param['mid_side_b2'])
+
+    def _resample(w, orig_sr, target_sr):
+        if use_gpu:
+            return resample_gpu(w, orig_sr, target_sr, device)
+        return librosa.resample(w, orig_sr=orig_sr, target_sr=target_sr, res_type="kaiser_fast")
 
     for d in range(1, bands_n + 1):
         bp = mp.param['band'][d]
         spec_s = np.ndarray(shape=(2, bp['n_fft'] // 2 + 1, spec_m.shape[2]), dtype=complex)
         h = bp['crop_stop'] - bp['crop_start']
         spec_s[:, bp['crop_start']:bp['crop_stop'], :] = spec_m[:, offset:offset+h, :]
-        
+
         offset += h
         if d == bands_n: # higher
             if extra_bins_h: # if --high_end_process bypass
@@ -295,41 +374,42 @@ def cmb_spectrogram_to_wave(spec_m, mp, extra_bins_h=None, extra_bins=None):
             if bp['hpf_start'] > 0:
                 spec_s = fft_hp_filter(spec_s, bp['hpf_start'], bp['hpf_stop'] - 1)
             if bands_n == 1:
-                wave = spectrogram_to_wave(spec_s, bp['hl'], mp.param['mid_side'], mp.param['mid_side_b2'], mp.param['reverse'])
+                wave = _istft(spec_s, bp['hl'])
             else:
-                wave = np.add(wave, spectrogram_to_wave(spec_s, bp['hl'], mp.param['mid_side'], mp.param['mid_side_b2'], mp.param['reverse']))
+                wave = np.add(wave, _istft(spec_s, bp['hl']))
         else:
             sr = mp.param['band'][d+1]['sr']
             if d == 1: # lower
                 spec_s = fft_lp_filter(spec_s, bp['lpf_start'], bp['lpf_stop'])
-                wave = librosa.resample(spectrogram_to_wave(spec_s, bp['hl'], mp.param['mid_side'], mp.param['mid_side_b2'], mp.param['reverse']), orig_sr=bp['sr'], target_sr=sr, res_type="sinc_fastest")
+                wave = _resample(_istft(spec_s, bp['hl']), bp['sr'], sr)
             else: # mid
                 spec_s = fft_hp_filter(spec_s, bp['hpf_start'], bp['hpf_stop'] - 1)
                 spec_s = fft_lp_filter(spec_s, bp['lpf_start'], bp['lpf_stop'])
-                wave2 = np.add(wave, spectrogram_to_wave(spec_s, bp['hl'], mp.param['mid_side'], mp.param['mid_side_b2'], mp.param['reverse']))
-                # wave = librosa.core.resample(wave2, bp['sr'], sr, res_type="sinc_fastest")
-                wave = librosa.resample(wave2, orig_sr=bp['sr'], target_sr=sr,res_type='scipy')
-        
+                wave2 = np.add(wave, _istft(spec_s, bp['hl']))
+                wave = _resample(wave2, bp['sr'], sr)
+
     return wave.T
 
 
 def fft_lp_filter(spec, bin_start, bin_stop):
-    g = 1.0
-    for b in range(bin_start, bin_stop):
-        g -= 1 / (bin_stop - bin_start)
-        spec[:, b, :] = g * spec[:, b, :]
-        
+    n = bin_stop - bin_start
+    if n > 0:
+        g = 1.0 - np.arange(1, n + 1) / n  # same ramp as the old loop, vectorized
+        spec[:, bin_start:bin_stop, :] *= g[None, :, None]
+
     spec[:, bin_stop:, :] *= 0
 
     return spec
 
 
 def fft_hp_filter(spec, bin_start, bin_stop):
-    g = 1.0
-    for b in range(bin_start, bin_stop, -1):
-        g -= 1 / (bin_start - bin_stop)
-        spec[:, b, :] = g * spec[:, b, :]
-    
+    n = bin_start - bin_stop
+    if n > 0:
+        # bins go from bin_start down to bin_stop+1, matching the old descending loop
+        idx = np.arange(bin_start, bin_stop, -1)
+        g = 1.0 - np.arange(1, len(idx) + 1) / n
+        spec[:, idx, :] *= g[None, :, None]
+
     spec[:, 0:bin_stop+1, :] *= 0
 
     return spec

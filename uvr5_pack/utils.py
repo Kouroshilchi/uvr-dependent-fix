@@ -15,26 +15,28 @@ def inference(X_spec, device, model, aggressiveness,data):
     data ： dic configs
     '''
     
-    def _execute(X_mag_pad, roi_size, n_window, device, model, aggressiveness,is_half=True):
+    def _execute(X_mag_pad, roi_size, n_window, device, model, aggressiveness,is_half=True, batch_size=4):
         model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             preds = []
-            
-            iterations = [n_window]
 
-            total_iterations = sum(iterations)            
-            for i in tqdm(range(n_window)): 
-                start = i * roi_size
-                X_mag_window = X_mag_pad[None, :, :, start:start + data['window_size']]
+            for i in tqdm(range(0, n_window, batch_size)):
+                batch = []
+                for j in range(i, min(i + batch_size, n_window)):
+                    start = j * roi_size
+                    batch.append(X_mag_pad[:, :, start:start + data['window_size']])
+
+                X_mag_window = np.stack(batch, axis=0)  # (B, ch, F, T)
                 X_mag_window = torch.from_numpy(X_mag_window)
                 if(is_half==True):X_mag_window=X_mag_window.half()
-                X_mag_window=X_mag_window.to(device)
+                X_mag_window=X_mag_window.to(device, non_blocking=True)
 
                 pred = model.predict(X_mag_window, aggressiveness)
 
                 pred = pred.detach().cpu().numpy()
-                preds.append(pred[0])
-                
+                for k in range(pred.shape[0]):
+                    preds.append(pred[k])
+
             pred = np.concatenate(preds, axis=2)
         return pred
     
@@ -55,12 +57,14 @@ def inference(X_spec, device, model, aggressiveness,data):
     n_window = int(np.ceil(n_frame / roi_size))
 
     X_mag_pad = np.pad(
-        X_mag_pre, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
+        X_mag_pre, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant').astype(np.float32)
+
+    batch_size = data.get('batch_size', 4)
 
     if(list(model.state_dict().values())[0].dtype==torch.float16):is_half=True
     else:is_half=False
     pred = _execute(X_mag_pad, roi_size, n_window,
-                        device, model, aggressiveness,is_half)
+                        device, model, aggressiveness,is_half,batch_size)
     pred = pred[:, :, :n_frame]
     
     if data['tta']:
@@ -69,10 +73,10 @@ def inference(X_spec, device, model, aggressiveness,data):
         n_window += 1
 
         X_mag_pad = np.pad(
-            X_mag_pre, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
+            X_mag_pre, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant').astype(np.float32)
 
         pred_tta = _execute(X_mag_pad, roi_size, n_window,
-                                device, model, aggressiveness,is_half)
+                                device, model, aggressiveness,is_half,batch_size)
         pred_tta = pred_tta[:, :, roi_size // 2:]
         pred_tta = pred_tta[:, :, :n_frame]
 
