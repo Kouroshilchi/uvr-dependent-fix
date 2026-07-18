@@ -50,6 +50,9 @@ class ModelParameters(object):
             with zipfile.ZipFile(config_path, 'r') as zip:
                 self.param = json.loads(zip.read('param.json'), object_pairs_hook=int_keys)
         elif '.json' == pathlib.Path(config_path).suffix:
+            config_path = pathlib.Path(config_path)
+            if not config_path.is_absolute():
+                config_path = pathlib.Path(__file__).resolve().parents[2] / config_path
             with open(config_path, 'r') as f:
                 self.param = json.loads(f.read(), object_pairs_hook=int_keys)
         else:
